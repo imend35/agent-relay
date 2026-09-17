@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+__pycache__
+.pytest_cache
+*.pyc
+*.db
+*.db-*
+*-credentials.json
+.env
+.env.*
+integration_test.py
+test_*.py

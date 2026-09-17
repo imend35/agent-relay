@@ -1,9 +1,8 @@
 """Persistence operations for Agent Relay.
 
 Routes and the worker call these functions instead of issuing SQL directly.
-Claim, heartbeat, terminal submission, and recovery each use the same atomic
-SQLite transaction seam, which is the one area students will later replace by
-PostgreSQL row-locking operations.
+SQLite uses the database writer transaction to serialize queue changes;
+PostgreSQL uses row-level locks for the same operations.
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ from sqlalchemy.orm import Session
 from database import (
     Agent,
     Attempt,
+    DATABASE_URL,
     LEASE_SECONDS,
     MAX_ATTEMPTS,
     Task,
@@ -54,6 +54,18 @@ def payload_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _is_postgresql() -> bool:
+    return DATABASE_URL.startswith(("postgresql", "postgres"))
+
+
+def _lock_rows(query: Any, *, skip_locked: bool = False) -> Any:
+    """Add PostgreSQL row locks while leaving SQLite SQL unchanged."""
+
+    if _is_postgresql():
+        return query.with_for_update(skip_locked=skip_locked)
+    return query
+
+
 def register_agent(name: str, description: str | None) -> dict[str, str]:
     agent_id = new_id("agent")
     token = new_secret("agt")
@@ -78,7 +90,7 @@ def authenticate(token: str) -> Agent:
     # the same writer boundary as task operations so concurrent workers do not
     # hold stale WAL snapshots while trying to update it.
     with immediate_transaction() as db:
-        agent = db.scalar(select(Agent).where(Agent.token_hash == token_digest))
+        agent = db.scalar(_lock_rows(select(Agent).where(Agent.token_hash == token_digest)))
         if agent is None or not hmac.compare_digest(agent.token_hash, token_digest):
             raise RelayError("invalid_credentials", "The agent token is invalid.", 401)
         agent.last_seen_at = as_db_time(utcnow())
@@ -145,10 +157,13 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
         now = utcnow()
         recover_expired_in_session(db, now)
         task = db.scalar(
-            select(Task)
-            .where(Task.recipient_id == agent_id, Task.status == "queued")
-            .order_by(Task.created_at, Task.id)
-            .limit(1)
+            _lock_rows(
+                select(Task)
+                .where(Task.recipient_id == agent_id, Task.status == "queued")
+                .order_by(Task.created_at, Task.id)
+                .limit(1),
+                skip_locked=True,
+            )
         )
         if task is None:
             return None
@@ -189,13 +204,15 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
 
 def _find_attempt_for_token(db: Session, task_id: str, token: str) -> Attempt | None:
     return db.scalar(
-        select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
+        _lock_rows(
+            select(Attempt).where(Attempt.task_id == task_id, Attempt.claim_token_hash == secret_hash(token))
+        )
     )
 
 
 def heartbeat(task_id: str, agent_id: str, claim_token: str) -> str:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        task = db.scalar(_lock_rows(select(Task).where(Task.id == task_id)))
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)
@@ -222,7 +239,7 @@ def commit_terminal(
     value: str,
 ) -> dict[str, str]:
     with immediate_transaction() as db:
-        task = db.get(Task, task_id)
+        task = db.scalar(_lock_rows(select(Task).where(Task.id == task_id)))
         if task is None or task.recipient_id != agent_id:
             raise RelayError("not_found", "Task not found.", 404)
         attempt = _find_attempt_for_token(db, task_id, claim_token)

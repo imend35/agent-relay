@@ -1,8 +1,11 @@
 .venv
 .ruff_cache/
-*.db
-*.db-shm
-*.db-wal
 __pycache__/
 .pytest_cache/
+*.py[cod]
+*.db
+*.db-*
 *-credentials.json
+.env
+.env.*
+docker-data/

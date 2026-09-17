@@ -17,3 +17,8 @@ dev = [
     "httpx>=0.28.1",
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: test a running Agent Relay service and its database",
+]
